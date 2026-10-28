@@ -5,5 +5,4 @@ order_id,customer_id,product_id,quantity,order_date,status
 1004,3,104,3,2026-10-26,cancelled
 1005,4,102,1,2026-10-27,delivered
 1006,5,101,1,2026-10-27,shipped
-1007,2,104,2,2026-10-27,delivered
-1007,2,104,2,2026-10-27,delivered
+1007,2,104,2,2026-10-27,delivered 
