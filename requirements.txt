@@ -2,3 +2,4 @@
 streamlit
 pandas
 plotly
+psycopg[binary]==3.3.6
