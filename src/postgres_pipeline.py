@@ -5,6 +5,13 @@ from pathlib import Path
 import pandas as pd
 import psycopg
 
+# Fixed import: both Python files are inside the same src folder.
+from incremental_utils import (
+    file_fingerprint,
+    has_file_changed,
+    save_file_fingerprint,
+)
+
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
@@ -31,14 +38,14 @@ def normalize_value(value):
 
 
 def upsert_table(cur, table, key, columns, df):
-    selected = df[[key] + columns]
     rows = [
         tuple(normalize_value(value) for value in row)
-        for row in selected.itertuples(index=False, name=None)
+        for row in df[[key] + columns].itertuples(index=False, name=None)
     ]
 
+    stats = {"inserted": 0, "updated": 0, "unchanged": 0}
     if not rows:
-        return {"inserted": 0, "updated": 0, "unchanged": 0}
+        return stats
 
     ids = [row[0] for row in rows]
 
@@ -52,12 +59,8 @@ def upsert_table(cur, table, key, columns, df):
         for record in cur.fetchall()
     }
 
-    stats = {"inserted": 0, "updated": 0, "unchanged": 0}
-
     for row in rows:
-        record_id = row[0]
-        values = tuple(row[1:])
-
+        record_id, values = row[0], tuple(row[1:])
         if record_id not in existing:
             stats["inserted"] += 1
         elif existing[record_id] == values:
@@ -82,45 +85,7 @@ def upsert_table(cur, table, key, columns, df):
         WHERE {update_condition}
     """
     cur.executemany(sql, rows)
-
     return stats
-
-
-def write_run_log(conn, run_id, stats, status, error_message=None):
-    """Save the ETL run outcome in a separate transaction."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE etl_run_log
-            SET finished_at = NOW(),
-                status = %s,
-                customers_inserted = %s,
-                customers_updated = %s,
-                customers_unchanged = %s,
-                products_inserted = %s,
-                products_updated = %s,
-                products_unchanged = %s,
-                orders_inserted = %s,
-                orders_updated = %s,
-                orders_unchanged = %s,
-                error_message = %s
-            WHERE run_id = %s
-            """,
-            (
-                status,
-                stats["customers"]["inserted"],
-                stats["customers"]["updated"],
-                stats["customers"]["unchanged"],
-                stats["products"]["inserted"],
-                stats["products"]["updated"],
-                stats["products"]["unchanged"],
-                stats["orders"]["inserted"],
-                stats["orders"]["updated"],
-                stats["orders"]["unchanged"],
-                error_message,
-                run_id,
-            ),
-        )
 
 
 def load_data() -> None:
@@ -130,7 +95,9 @@ def load_data() -> None:
         "orders": {"inserted": 0, "updated": 0, "unchanged": 0},
     }
 
-    # Create a run record first so failed runs can also be logged.
+    run_id = None
+
+    # Create a run record first.
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -139,42 +106,131 @@ def load_data() -> None:
             run_id = cur.fetchone()[0]
 
     try:
-        customers = load_csv("customers.csv")
-        products = load_csv("products.csv")
-        orders = load_csv("orders.csv")
+        filenames = [
+            "customers.csv",
+            "products.csv",
+            "orders.csv",
+        ]
+        fingerprints = {
+            filename: file_fingerprint(DATA_DIR / filename)
+            for filename in filenames
+        }
 
-        orders["order_date"] = pd.to_datetime(
-            orders["order_date"], errors="raise"
-        ).dt.date
+        with psycopg.connect(DATABASE_URL) as conn:
+            changed_files = {
+                filename: has_file_changed(conn, filename, fingerprint)
+                for filename, fingerprint in fingerprints.items()
+            }
 
-        for name, df, key in [
-            ("customers", customers, "customer_id"),
-            ("products", products, "product_id"),
-            ("orders", orders, "order_id"),
-        ]:
-            if df[key].isna().any():
-                raise ValueError(f"Missing {key} found in {name}.csv")
-            if df[key].duplicated().any():
-                raise ValueError(f"Duplicate {key} found in {name}.csv")
+        if not any(changed_files.values()):
+            print("No CSV files changed. Database processing skipped.")
+        else:
+            customers = (
+                load_csv("customers.csv")
+                if changed_files["customers.csv"]
+                else None
+            )
+            products = (
+                load_csv("products.csv")
+                if changed_files["products.csv"]
+                else None
+            )
+            orders = (
+                load_csv("orders.csv")
+                if changed_files["orders.csv"]
+                else None
+            )
+
+            if orders is not None:
+                orders["order_date"] = pd.to_datetime(
+                    orders["order_date"], errors="raise"
+                ).dt.date
+
+            for name, df, key in [
+                ("customers", customers, "customer_id"),
+                ("products", products, "product_id"),
+                ("orders", orders, "order_id"),
+            ]:
+                if df is not None:
+                    if df[key].isna().any():
+                        raise ValueError(f"Missing {key} in {name}.csv")
+                    if df[key].duplicated().any():
+                        raise ValueError(f"Duplicate {key} in {name}.csv")
+
+            with psycopg.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cur:
+                    if customers is not None:
+                        stats["customers"] = upsert_table(
+                            cur,
+                            "customers",
+                            "customer_id",
+                            ["name", "city"],
+                            customers,
+                        )
+
+                    if products is not None:
+                        stats["products"] = upsert_table(
+                            cur,
+                            "products",
+                            "product_id",
+                            ["product_name", "price"],
+                            products,
+                        )
+
+                    if orders is not None:
+                        stats["orders"] = upsert_table(
+                            cur,
+                            "orders",
+                            "order_id",
+                            [
+                                "customer_id",
+                                "product_id",
+                                "quantity",
+                                "order_date",
+                                "status",
+                            ],
+                            orders,
+                        )
+
+            # Save fingerprints only after the data transaction succeeded.
+            with psycopg.connect(DATABASE_URL) as conn:
+                for filename, changed in changed_files.items():
+                    if changed:
+                        save_file_fingerprint(
+                            conn, filename, fingerprints[filename]
+                        )
 
         with psycopg.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
-                stats["customers"] = upsert_table(
-                    cur, "customers", "customer_id",
-                    ["name", "city"], customers
+                cur.execute(
+                    """
+                    UPDATE etl_run_log
+                    SET finished_at = NOW(),
+                        status = 'success',
+                        customers_inserted = %s,
+                        customers_updated = %s,
+                        customers_unchanged = %s,
+                        products_inserted = %s,
+                        products_updated = %s,
+                        products_unchanged = %s,
+                        orders_inserted = %s,
+                        orders_updated = %s,
+                        orders_unchanged = %s
+                    WHERE run_id = %s
+                    """,
+                    (
+                        stats["customers"]["inserted"],
+                        stats["customers"]["updated"],
+                        stats["customers"]["unchanged"],
+                        stats["products"]["inserted"],
+                        stats["products"]["updated"],
+                        stats["products"]["unchanged"],
+                        stats["orders"]["inserted"],
+                        stats["orders"]["updated"],
+                        stats["orders"]["unchanged"],
+                        run_id,
+                    ),
                 )
-                stats["products"] = upsert_table(
-                    cur, "products", "product_id",
-                    ["product_name", "price"], products
-                )
-                stats["orders"] = upsert_table(
-                    cur, "orders", "order_id",
-                    ["customer_id", "product_id", "quantity", "order_date", "status"],
-                    orders
-                )
-
-        with psycopg.connect(DATABASE_URL) as conn:
-            write_run_log(conn, run_id, stats, "success")
 
         print("ETL completed successfully.")
         for name, result in stats.items():
@@ -187,7 +243,17 @@ def load_data() -> None:
 
     except Exception as exc:
         with psycopg.connect(DATABASE_URL) as conn:
-            write_run_log(conn, run_id, stats, "failed", str(exc))
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE etl_run_log
+                    SET finished_at = NOW(),
+                        status = 'failed',
+                        error_message = %s
+                    WHERE run_id = %s
+                    """,
+                    (str(exc), run_id),
+                )
         raise
 
 
