@@ -5,3 +5,5 @@ __pycache__/
 pipeline.log
 ecommerce.db
 .venv-win/
+airflow/logs/
+airflow/plugins/__pycache__/
